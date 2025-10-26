@@ -1,6 +1,14 @@
 # Swift Identifier Extractor - RunPod GPU
 
-RunPod GPU 환경에서 Swift 소스코드 데이터셋으로부터 식별자를 추출하는 프로젝트
+RunPod GPU 환경에서 학습된 LoRA 모델로 Swift 식별자를 추출하는 프로젝트
+
+## ✨ 주요 특징
+
+- ✅ **학습 형식 일치**: Alpaca 형식 (### Instruction / ### Input / ### Response)
+- ✅ **해시 기반 체크포인트**: 동일한 입력은 자동으로 스킵
+- 🔄 **안전한 중단/재개**: Ctrl+C로 중단해도 진행상황 보존
+- 🚀 **GPU 가속**: CUDA 지원으로 빠른 추론
+- 📊 **토큰 수 필터링**: 학습 시 사용한 토큰 제한 준수
 
 ## 📁 프로젝트 구조
 
@@ -11,11 +19,11 @@ swift-identifier-extractor/
 ├── requirements.txt          # Python 패키지
 ├── README.md                 # 이 파일
 ├── models/                   # 모델 파일 (업로드 필요)
-│   ├── base_model.gguf       # 베이스 모델
-│   └── lora.gguf             # LoRA 어댑터
+│   ├── base_model.gguf       # Phi-3-mini-128k-instruct (GGUF)
+│   └── lora.gguf             # 학습된 LoRA 어댑터 (GGUF)
 ├── dataset.jsonl             # 입력 데이터셋 (업로드 필요)
 ├── checkpoint/               # 진행상황 저장
-│   └── processed.txt         # 처리 완료 파일 목록
+│   └── processed.jsonl       # 처리 완료 항목 (해시 + 결과)
 └── output/                   # 결과 출력
     ├── identifiers.txt       # 추출된 식별자 목록
     └── identifiers_summary.json
@@ -34,17 +42,44 @@ bash setup.sh
 ### 2단계: 파일 업로드
 
 1. **모델 파일** → `models/` 디렉토리
-   - `base_model.gguf` (베이스 모델)
-   - `lora.gguf` (LoRA 어댑터)
+   - `base_model.gguf` (Phi-3-mini-128k-instruct GGUF 버전)
+   - `lora.gguf` (학습된 LoRA 어댑터 GGUF 버전)
 
 2. **데이터셋** → 프로젝트 루트
-   - `dataset.jsonl`
+   - `dataset.jsonl` (instruction, input 포함)
 
 ### 3단계: 추론 실행
 
 ```bash
 python run_inference.py
 ```
+
+---
+
+## 📊 입력 데이터 형식 (중요!)
+
+### JSONL 형식 (Alpaca)
+```jsonl
+{"instruction": "You are an expert Swift code auditor...", "input": "### Swift Source Code:\n```swift\n...\n```\n\n### AST Symbol Information:\n...", "output": "{\"identifiers\": [\"id1\", \"id2\"]}"}
+```
+
+**필수 필드:**
+- `instruction`: 모델에게 주는 지시사항 (학습 시 사용한 instruction과 동일)
+- `input`: Swift 코드 + AST + Rule 정보
+- `output`: (선택) 정답 레이블 (추론 시에는 무시됨)
+
+**프롬프트 형식 (자동 생성):**
+```
+### Instruction:
+{instruction}
+
+### Input:
+{input}
+
+### Response:
+```
+
+이 형식은 학습 시 사용한 `format_example` 함수와 동일합니다.
 
 ---
 
@@ -59,31 +94,50 @@ python run_inference.py
 ```bash
 python run_inference.py \
   --dataset my_dataset.jsonl \
-  --base_model models/phi-3-128k.gguf \
-  --lora models/my_lora.gguf \
+  --base_model models/phi-3-mini-128k-instruct.gguf \
+  --lora models/phi3_lora_adapter-Q4_K_M.gguf \
   --output output/my_identifiers.txt \
-  --ctx 8192 \
+  --ctx 12288 \
+  --max_input_tokens 10500 \
   --gpu_layers -1
 ```
 
 ### 옵션 설명
 
-| 옵션 | 설명 | 기본값 |
-|------|------|--------|
-| `--dataset` | 입력 JSONL 파일 | `dataset.jsonl` |
-| `--base_model` | 베이스 모델 경로 | `models/base_model.gguf` |
-| `--lora` | LoRA 어댑터 경로 | `models/lora.gguf` |
-| `--output` | 출력 파일 경로 | `output/identifiers.txt` |
-| `--ctx` | 컨텍스트 크기 | `8192` |
-| `--gpu_layers` | GPU 레이어 수 (-1 = 전체) | `-1` |
-| `--reset` | 체크포인트 초기화 | `False` |
+| 옵션 | 설명 | 기본값 | 비고 |
+|------|------|--------|------|
+| `--dataset` | 입력 JSONL 파일 | `dataset.jsonl` | Alpaca 형식 |
+| `--base_model` | 베이스 모델 경로 | `models/base_model.gguf` | Phi-3 GGUF |
+| `--lora` | LoRA 어댑터 경로 | `models/lora.gguf` | 학습된 어댑터 |
+| `--output` | 출력 파일 경로 | `output/identifiers.txt` | |
+| `--ctx` | 컨텍스트 크기 | `12288` | 학습 시 사용 |
+| `--max_input_tokens` | 최대 입력 토큰 | `10500` | 필터링 기준 |
+| `--gpu_layers` | GPU 레이어 수 | `-1` (전체) | |
+| `--reset` | 체크포인트 초기화 | `False` | |
+
+---
+
+## 🔐 해시 기반 체크포인트
+
+### 작동 원리
+
+1. **해시 생성**: `instruction + input`을 SHA-256 해싱
+2. **자동 스킵**: 동일한 해시는 재처리하지 않음
+3. **결과 캐싱**: 체크포인트에 해시 + 결과 저장
+
+### 체크포인트 파일 형식
+
+```jsonl
+{"hash": "a1b2c3...", "result": {"identifiers": ["id1", "id2"]}}
+{"hash": "d4e5f6...", "result": {"identifiers": ["id3", "id4"]}}
+```
 
 ---
 
 ## 💾 중단 및 재개
 
 ### 자동 체크포인트
-- 처리 완료된 파일은 `checkpoint/processed.txt`에 자동 저장
+- 처리 완료된 항목은 `checkpoint/processed.jsonl`에 자동 저장
 - **Ctrl+C로 중단해도 안전**
 - 다음 실행 시 자동으로 이어서 처리
 
@@ -94,18 +148,22 @@ python run_inference.py --reset
 
 ---
 
-## 📊 입력 데이터 형식
+## 📈 토큰 수 관리
 
-### JSONL 형식
-```jsonl
-{"filename": "Alamofire_Session.swift", "repo": "Alamofire", "code": "import Foundation\n...", "size": 12345}
-{"filename": "Kingfisher_ImageCache.swift", "repo": "Kingfisher", "code": "import UIKit\n...", "size": 8900}
+### 학습 시 설정
+- **max_length**: 12288 tokens
+- **실제 데이터**: ~10500 tokens 이하로 필터링됨
+
+### 추론 시 설정
+- **n_ctx**: 12288 (입력 컨텍스트)
+- **max_tokens**: 8192 (출력 생성)
+- **입력 필터링**: ~10500 tokens 이하만 처리
+
+### 토큰 수 확인
+```python
+# 대략적인 토큰 수 = 문자 수 / 4
+approx_tokens = len(instruction + input_text) / 4
 ```
-
-**필수 필드:**
-- `filename`: 파일명
-- `repo`: 레포지토리 이름
-- `code`: Swift 소스코드
 
 ---
 
@@ -141,21 +199,13 @@ nvidia-smi
 ```
 
 ### GPU 메모리 최적화
-```python
+```bash
 # 모든 레이어를 GPU에 로드 (권장)
 --gpu_layers -1
 
 # 일부 레이어만 GPU에 로드
 --gpu_layers 32
 ```
-
----
-
-## 📈 성능 팁
-
-1. **컨텍스트 크기**: 큰 파일이 많으면 `--ctx 16384` 사용
-2. **GPU 레이어**: 메모리가 충분하면 `-1` (전체 로드)
-3. **배치 처리**: 현재는 순차 처리 (안정성 우선)
 
 ---
 
@@ -176,14 +226,15 @@ pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-c
 # GPU 레이어 수 줄이기
 python run_inference.py --gpu_layers 24
 
-# 또는 컨텍스트 크기 줄이기
-python run_inference.py --ctx 4096
+# 또는 컨텍스트 크기 줄이기 (비권장)
+python run_inference.py --ctx 8192
 ```
 
-### 모델 로딩 실패
-- 모델 파일 경로 확인
-- 파일 권한 확인 (`chmod 644 models/*.gguf`)
-- 충분한 디스크 공간 확인
+### 토큰 수 초과
+```bash
+# 최대 입력 토큰 줄이기
+python run_inference.py --max_input_tokens 8000
+```
 
 ---
 
@@ -197,54 +248,68 @@ bash setup.sh
 ls models/
 ls dataset.jsonl
 
-# 3. 추론 실행
+# 3. 데이터셋 확인 (첫 줄 출력)
+head -n 1 dataset.jsonl | python -m json.tool
+
+# 4. 추론 실행
 python run_inference.py
 
-# 4. 결과 확인
+# 5. 결과 확인
 cat output/identifiers.txt | wc -l
 cat output/identifiers_summary.json
 
-# 5. 결과 다운로드
-# output/identifiers.txt 파일을 로컬로 다운로드
+# 6. 결과 다운로드
+# output/identifiers.txt를 로컬로 다운로드
 ```
 
 ---
 
-## 🔄 재실행 시나리오
+## 🎯 학습 형식과의 일치
 
-### 시나리오 1: 중단 후 재개
-```bash
-# 그냥 다시 실행하면 자동으로 이어서 처리됨
-python run_inference.py
+### 학습 시 사용한 `format_example` 함수
+```python
+def format_example(ex):
+    inst = ex.get("instruction")
+    inp = ex.get("input")
+    out = ex.get("output")
+    
+    if inp:
+        return f"### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n{out}<|endoftext|>"
+    else:
+        return f"### Instruction:\n{inst}\n\n### Response:\n{out}<|endoftext|>"
 ```
 
-### 시나리오 2: 처음부터 다시 시작
-```bash
-# 체크포인트 초기화
-python run_inference.py --reset
+### 추론 시 사용하는 `_format_prompt` 메서드
+```python
+def _format_prompt(self, instruction: str, input_text: str) -> str:
+    inst = instruction.strip()
+    inp = input_text.strip()
+    
+    if inp:
+        return f"### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n"
+    else:
+        return f"### Instruction:\n{inst}\n\n### Response:\n"
 ```
 
-### 시나리오 3: 다른 데이터셋으로 실행
-```bash
-# 새 데이터셋 + 새 출력 파일
-python run_inference.py \
-  --dataset new_dataset.jsonl \
-  --output output/new_identifiers.txt
-```
+✅ 완전히 동일한 형식!
 
 ---
 
 ## 💡 개발자 노트
 
-- **순차 처리**: 모델 안정성을 위해 현재는 순차 처리 (배치 처리는 향후 추가 가능)
-- **체크포인트**: 파일 단위로 저장되므로 안전하게 중단 가능
-- **중복 제거**: 실시간으로 중복이 제거되어 저장됨
+- **Alpaca 형식**: instruction + input → response 구조
+- **Stop tokens**: `<|endoftext|>`, `###` 사용
+- **해시 체크포인트**: instruction + input 기반
+- **토큰 필터링**: 학습 시 제한 준수
 
 ---
 
-## 📞 지원
+## 🤝 기여
 
-문제가 발생하면:
-1. `output/identifiers_summary.json` 확인
-2. `checkpoint/processed.txt` 확인
-3. 로그 메시지 확인
+이 프로젝트는 Swingft 프로젝트의 일부입니다.
+
+---
+
+## 📄 라이센스
+
+MIT

@@ -3,15 +3,17 @@
 run_inference.py
 
 RunPod GPU 환경에서 Swift 식별자 추출 실행
-- JSONL 데이터셋 입력
+- JSONL 데이터셋 입력 (instruction, input 구조)
+- 학습 시 사용한 Alpaca 형식과 동일하게 추론
 - 중단 시 재개 기능
-- 진행상황 저장
+- 해시 기반 체크포인트 (내용 변경 감지)
 """
 
 import json
 import os
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any
 from tqdm import tqdm
 import argparse
 from llama_cpp import Llama
@@ -23,19 +25,19 @@ class SwiftIdentifierExtractor:
     def __init__(self,
                  base_model_path: str,
                  lora_path: str,
-                 n_ctx: int = 8192,
-                 n_gpu_layers: int = -1,  # -1 = 모든 레이어 GPU에 로드
-                 checkpoint_file: str = "checkpoint/processed.txt"):
+                 n_ctx: int = 12288,  # 학습 시 사용한 컨텍스트 크기 12288
+                 n_gpu_layers: int = -1,
+                 checkpoint_file: str = "checkpoint/processed.jsonl"):
         """
         Args:
             base_model_path: 베이스 모델 경로
             lora_path: LoRA 어댑터 경로
-            n_ctx: 컨텍스트 크기
+            n_ctx: 컨텍스트 크기 (학습 시 12288)
             n_gpu_layers: GPU 레이어 수 (-1 = 전체)
             checkpoint_file: 처리 완료된 파일 기록
         """
         self.checkpoint_file = checkpoint_file
-        self.processed_files = self._load_checkpoint()
+        self.processed_hashes = self._load_checkpoint()
 
         print("=" * 60)
         print("모델 로딩 중...")
@@ -61,91 +63,129 @@ class SwiftIdentifierExtractor:
             print(f"❌ 모델 로딩 실패: {e}")
             raise
 
-    def _load_checkpoint(self) -> Set[str]:
-        """체크포인트 파일에서 처리 완료된 파일 목록 로드"""
-        if not os.path.exists(self.checkpoint_file):
-            return set()
+    def _compute_hash(self, instruction: str, input_text: str) -> str:
+        """instruction + input으로 해시 생성"""
+        combined = f"{instruction}::{input_text}"
+        return hashlib.sha256(combined.encode('utf-8')).hexdigest()
 
+    def _load_checkpoint(self) -> Dict[str, str]:
+        """체크포인트 로드
+
+        Returns:
+            Dict[hash, result]: 해시를 키로, 결과를 값으로
+        """
+        if not os.path.exists(self.checkpoint_file):
+            return {}
+
+        processed = {}
         with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-            processed = set(line.strip() for line in f if line.strip())
+            for line in f:
+                if line.strip():
+                    try:
+                        data = json.loads(line)
+                        processed[data['hash']] = data['result']
+                    except:
+                        continue
 
         if processed:
-            print(f"✅ 체크포인트 로드: {len(processed)}개 파일 이미 처리됨")
+            print(f"✅ 체크포인트 로드: {len(processed)}개 항목 이미 처리됨")
 
         return processed
 
-    def _save_checkpoint(self, filename: str):
-        """처리 완료된 파일을 체크포인트에 저장"""
+    def _save_checkpoint(self, content_hash: str, result: Dict[str, List[str]]):
+        """체크포인트 저장"""
         os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+
+        checkpoint_entry = {
+            "hash": content_hash,
+            "result": result
+        }
+
         with open(self.checkpoint_file, 'a', encoding='utf-8') as f:
-            f.write(f"{filename}\n")
-        self.processed_files.add(filename)
+            f.write(json.dumps(checkpoint_entry, ensure_ascii=False) + '\n')
 
-    def create_prompt(self, item: Dict[str, Any]) -> str:
-        """추론 프롬프트 생성"""
-        code = item.get('code', '')
-        repo = item.get('repo', 'unknown')
-        filename = item.get('filename', 'unknown')
+        self.processed_hashes[content_hash] = result
 
-        # 명확한 프롬프트
-        prompt = f"""Analyze the following Swift code and extract all identifiers that should be excluded from obfuscation.
+    def _should_process(self, instruction: str, input_text: str) -> tuple:
+        """처리 여부 확인
 
-**Repository:** {repo}
-**File:** {filename}
+        Returns:
+            (should_process: bool, cached_result: Dict or None)
+        """
+        current_hash = self._compute_hash(instruction, input_text)
 
-**Swift Code:**
-```swift
-{code}
-```
+        if current_hash in self.processed_hashes:
+            return False, self.processed_hashes[current_hash]
 
-Return ONLY a valid JSON object in this exact format:
-{{"identifiers": ["identifier1", "identifier2", "identifier3"]}}
+        return True, None
 
-Do not include any explanations or additional text. Only return the JSON object."""
+    def _format_prompt(self, instruction: str, input_text: str) -> str:
+        """학습 시 사용한 Alpaca 형식으로 프롬프트 생성
+
+        형식: ### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n
+        """
+        inst = instruction.strip()
+        inp = input_text.strip()
+
+        if inp:
+            prompt = f"### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n"
+        else:
+            prompt = f"### Instruction:\n{inst}\n\n### Response:\n"
 
         return prompt
 
     def extract_identifiers(self, item: Dict[str, Any]) -> List[str]:
-        """단일 항목에서 식별자 추출"""
-        filename = item.get('filename', 'unknown')
+        """단일 항목에서 식별자 추출
 
-        # 이미 처리된 파일 스킵
-        if filename in self.processed_files:
-            return []
+        Args:
+            item: {"instruction": "...", "input": "..."}
+        """
+        instruction = item.get('instruction', '')
+        input_text = item.get('input', '')
 
-        prompt = self.create_prompt(item)
+        # 체크포인트 확인
+        should_process, cached_result = self._should_process(instruction, input_text)
+
+        if not should_process:
+            print(f"  💾 캐시된 결과 사용")
+            return cached_result.get('identifiers', [])
+
+        # 프롬프트 생성 (학습 형식과 동일)
+        prompt = self._format_prompt(instruction, input_text)
 
         try:
-            response = self.model.create_chat_completion(
-                messages=[
-                    {"role": "system", "content": "You are a Swift code analyzer. Always return valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
+            response = self.model.create_completion(
+                prompt=prompt,
+                max_tokens=8192,  # 출력은 8192면 충분
                 temperature=0.1,
                 top_p=0.95,
-                max_tokens=2048,
-                stop=["```", "\n\n\n"]  # 조기 종료로 깔끔한 출력
+                stop=["<|endoftext|>", "###"],  # 학습 시 사용한 stop token
+                echo=False
             )
 
-            output = response['choices'][0]['message']['content'].strip()
+            output = response['choices'][0]['text'].strip()
 
             # JSON 파싱
             identifiers = self._parse_output(output)
 
+            # 결과 딕셔너리
+            result = {"identifiers": identifiers}
+
             # 체크포인트 저장
-            self._save_checkpoint(filename)
+            content_hash = self._compute_hash(instruction, input_text)
+            self._save_checkpoint(content_hash, result)
 
             return identifiers
 
         except Exception as e:
-            print(f"\n⚠️  에러 발생 ({filename}): {e}")
+            print(f"\n⚠️  에러 발생: {e}")
             return []
 
     def _parse_output(self, output: str) -> List[str]:
-        """모델 출력에서 식별자 리스트 추출 (강력한 파싱)"""
+        """모델 출력에서 식별자 리스트 추출"""
         import re
 
-        # 방법 1: 깨끗한 JSON 블록 파싱
+        # 방법 1: JSON 블록 파싱
         try:
             start_idx = output.find('{')
             end_idx = output.rfind('}')
@@ -164,7 +204,7 @@ Do not include any explanations or additional text. Only return the JSON object.
         except:
             pass
 
-        # 방법 2: 배열만 추출 ["id1", "id2"]
+        # 방법 2: 배열만 추출
         try:
             array_match = re.search(r'\[([^\]]+)\]', output)
             if array_match:
@@ -177,16 +217,15 @@ Do not include any explanations or additional text. Only return the JSON object.
         # 방법 3: 따옴표로 감싼 문자열들 추출
         try:
             identifiers = re.findall(r'"([^"]+)"', output)
-            # 키워드 필터링
             filtered = [
                 id for id in identifiers
                 if id not in ['identifiers', 'reasoning', 'error', 'exclusions', 'evidence']
-                   and len(id) > 1  # 너무 짧은 것 제외
-                   and not id.startswith('is_')  # 플래그 제외
-                   and not id.startswith('This ')  # 설명문 제외
+                   and len(id) > 1
+                   and not id.startswith('is_')
+                   and not id.startswith('This ')
             ]
             if filtered:
-                return filtered[:50]  # 최대 50개
+                return filtered[:50]
         except:
             pass
 
@@ -195,8 +234,14 @@ Do not include any explanations or additional text. Only return the JSON object.
     def process_dataset(self,
                         dataset_path: str,
                         output_file: str = "output/identifiers.txt",
-                        batch_size: int = 1) -> Dict[str, Any]:
-        """전체 데이터셋 처리"""
+                        max_input_tokens: int = 10500) -> Dict[str, Any]:
+        """전체 데이터셋 처리
+
+        Args:
+            dataset_path: 입력 JSONL 파일
+            output_file: 출력 파일
+            max_input_tokens: 최대 입력 토큰 수 (학습 시 12000 기준)
+        """
         print("=" * 60)
         print("데이터셋 처리 시작")
         print("=" * 60)
@@ -206,16 +251,43 @@ Do not include any explanations or additional text. Only return the JSON object.
         with open(dataset_path, 'r', encoding='utf-8') as f:
             for line in f:
                 if line.strip():
-                    dataset.append(json.loads(line))
+                    try:
+                        item = json.loads(line)
+
+                        # 토큰 수 대략 추정 (문자 수 / 4)
+                        instruction = item.get('instruction', '')
+                        input_text = item.get('input', '')
+                        combined = instruction + input_text
+                        approx_tokens = len(combined) / 4
+
+                        # 최대 토큰 수 필터링
+                        if approx_tokens <= max_input_tokens:
+                            dataset.append(item)
+                        else:
+                            print(f"⚠️  토큰 수 초과로 스킵: ~{int(approx_tokens)} tokens")
+                    except json.JSONDecodeError:
+                        continue
 
         total_items = len(dataset)
-        already_processed = len([item for item in dataset if item.get('filename') in self.processed_files])
+
+        # 처리 필요한 항목 계산
+        need_processing = []
+        for item in dataset:
+            should_process, _ = self._should_process(
+                item.get('instruction', ''),
+                item.get('input', '')
+            )
+            if should_process:
+                need_processing.append(item)
+
+        already_processed = total_items - len(need_processing)
 
         print(f"전체 항목: {total_items}개")
         print(f"처리 완료: {already_processed}개")
-        print(f"처리 필요: {total_items - already_processed}개\n")
+        print(f"처리 필요: {len(need_processing)}개")
+        print(f"최대 입력 토큰: ~{max_input_tokens} tokens\n")
 
-        if already_processed == total_items:
+        if len(need_processing) == 0:
             print("✅ 모든 항목이 이미 처리되었습니다!")
             return self._load_results(output_file)
 
@@ -228,7 +300,7 @@ Do not include any explanations or additional text. Only return the JSON object.
                 all_identifiers.extend(identifiers)
                 pbar.update(1)
 
-                # 실시간 저장 (중복 제거 후)
+                # 실시간 저장
                 if identifiers:
                     self._save_identifiers(all_identifiers, output_file)
 
@@ -269,8 +341,8 @@ Do not include any explanations or additional text. Only return the JSON object.
             identifiers = [line.strip() for line in f if line.strip()]
 
         return {
-            "total_items": len(self.processed_files),
-            "processed_items": len(self.processed_files),
+            "total_items": len(self.processed_hashes),
+            "processed_items": len(self.processed_hashes),
             "total_identifiers": len(identifiers),
             "unique_identifiers": len(identifiers),
             "output_file": output_file
@@ -307,14 +379,20 @@ def main():
     parser.add_argument(
         '--ctx',
         type=int,
-        default=8192,
-        help='컨텍스트 크기 (기본값: 8192)'
+        default=12288,
+        help='컨텍스트 크기 (기본값: 12288, 학습 시 사용)'
     )
     parser.add_argument(
         '--gpu_layers',
         type=int,
         default=-1,
         help='GPU 레이어 수 (기본값: -1 = 전체)'
+    )
+    parser.add_argument(
+        '--max_input_tokens',
+        type=int,
+        default=10500,
+        help='최대 입력 토큰 수 (기본값: 10500)'
     )
     parser.add_argument(
         '--reset',
@@ -326,7 +404,7 @@ def main():
 
     # 체크포인트 초기화
     if args.reset:
-        checkpoint_file = "checkpoint/processed.txt"
+        checkpoint_file = "checkpoint/processed.jsonl"
         if os.path.exists(checkpoint_file):
             os.remove(checkpoint_file)
             print("✅ 체크포인트 초기화됨\n")
@@ -355,7 +433,8 @@ def main():
 
         results = extractor.process_dataset(
             dataset_path=args.dataset,
-            output_file=args.output
+            output_file=args.output,
+            max_input_tokens=args.max_input_tokens
         )
 
         # 결과 요약 저장
